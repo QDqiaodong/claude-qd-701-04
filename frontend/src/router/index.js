@@ -53,6 +53,13 @@ export const navItems = [
     icon: '📜',
     label: '适航指令追踪',
     hint: '编号·修订版·三类阈值·落实清单·证据·批量重算'
+  },
+  {
+    key: 'weight',
+    path: '/weight',
+    icon: '⚖️',
+    label: '称重与重心',
+    hint: '规则版本·实机称重·包线判定·构型调整链·版本对比'
   }
 ]
 
@@ -65,6 +72,7 @@ const routes = [
   { path: '/parts', name: 'parts', component: () => import('../views/PartView.vue') },
   { path: '/release', name: 'release', component: () => import('../views/ReleaseView.vue') },
   { path: '/ad', name: 'ad', component: () => import('../views/AdView.vue') },
+  { path: '/weight', name: 'weight', component: () => import('../views/WeightView.vue') },
   { path: '/:pathMatch(.*)*', redirect: '/hangar' }
 ]
 

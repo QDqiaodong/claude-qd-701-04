@@ -280,6 +280,89 @@ public final class MroDict {
         return v;
     }
 
+    // ---------------- 模块八：飞机称重与重心 ----------------
+    /** 规则版本状态：草稿（可改，未生效） */
+    public static final String RULE_DRAFT = "DRAFT";
+    public static final String RULE_EFFECTIVE = "EFFECTIVE";
+    public static final String RULE_SUPERSEDED = "SUPERSEDED";
+
+    /** 称重单状态：待复核 / 已复核确认（成为基线） */
+    public static final String WB_DRAFT = "DRAFT";
+    public static final String WB_CONFIRMED = "CONFIRMED";
+
+    /** 构型版本来源：称重基线 / 构型调整派生 */
+    public static final String CFG_BASELINE = "BASELINE";
+    public static final String CFG_ADJUSTMENT = "ADJUSTMENT";
+
+    private static final Map<String, String> RULE_STATUS_NAME = Map.of(
+            RULE_DRAFT, "草稿（未生效）",
+            RULE_EFFECTIVE, "生效中",
+            RULE_SUPERSEDED, "已被取代（冻结）");
+
+    private static final Map<String, String> WB_STATUS_NAME = Map.of(
+            WB_DRAFT, "待复核",
+            WB_CONFIRMED, "已确认基线");
+
+    private static final Map<String, String> CFG_SOURCE_NAME = Map.of(
+            CFG_BASELINE, "称重基线",
+            CFG_ADJUSTMENT, "构型调整");
+
+    private static final Map<String, String> WB_UNIT_SYSTEM_NAME = Map.of(
+            "METRIC", "公制 kg/mm",
+            "IMPERIAL", "英制 lb/in");
+
+    private static final Map<String, String> WB_PIVOT_NAME = Map.of(
+            "NOSE", "前起落架",
+            "LEFT_MAIN", "左主起落架",
+            "RIGHT_MAIN", "右主起落架");
+
+    private static final Map<String, String> WB_DIRECTION_NAME = Map.of(
+            "INSTALL", "安装",
+            "REMOVE", "拆除");
+
+    private static final Map<String, String> WB_TEMP_KIND_NAME = Map.of(
+            "ADD", "补入",
+            "DEDUCT", "扣除");
+
+    private static final Map<String, String> WB_ENVELOPE_NAME = Map.of(
+            "IN_ENVELOPE", "包线内",
+            "OUT_OF_ENVELOPE", "包线外",
+            "INDETERMINATE", "无法判定");
+
+    // ---------------- 模块八取值方法 ----------------
+
+    public static String ruleStatusName(String status) {
+        return status == null ? "" : RULE_STATUS_NAME.getOrDefault(status, status);
+    }
+
+    public static String wbStatusName(String status) {
+        return status == null ? "" : WB_STATUS_NAME.getOrDefault(status, status);
+    }
+
+    public static String cfgSourceName(String source) {
+        return source == null ? "" : CFG_SOURCE_NAME.getOrDefault(source, source);
+    }
+
+    public static String wbUnitSystemName(String unitSystem) {
+        return unitSystem == null ? "" : WB_UNIT_SYSTEM_NAME.getOrDefault(unitSystem, unitSystem);
+    }
+
+    public static String wbPivotName(String code) {
+        return code == null ? "" : WB_PIVOT_NAME.getOrDefault(code, code);
+    }
+
+    public static String wbDirectionName(String direction) {
+        return direction == null ? "" : WB_DIRECTION_NAME.getOrDefault(direction, direction);
+    }
+
+    public static String wbTempKindName(String kind) {
+        return kind == null ? "" : WB_TEMP_KIND_NAME.getOrDefault(kind, kind);
+    }
+
+    public static String wbEnvelopeName(String status) {
+        return status == null ? "" : WB_ENVELOPE_NAME.getOrDefault(status, status);
+    }
+
     // ---------------- 模块七取值方法 ----------------
 
     public static String adStatusName(String status) {

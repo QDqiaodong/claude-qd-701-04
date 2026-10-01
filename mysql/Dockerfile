@@ -16,6 +16,7 @@ ENV MYSQL_DATABASE=${MYSQL_DATABASE} \
     MYSQL_INITDB_SKIP_TZINFO=1
 
 COPY schema.sql /docker-entrypoint-initdb.d/01-schema.sql
+COPY schema-weight.sql /docker-entrypoint-initdb.d/02-schema-weight.sql
 
 RUN set -eux; \
     /entrypoint.sh mysqld --skip-log-bin --performance-schema=OFF & \
@@ -29,4 +30,4 @@ RUN set -eux; \
     mysql -h 127.0.0.1 -uroot -p"${MYSQL_ROOT_PASSWORD}" -e "SHOW DATABASES;" >/dev/null; \
     mysqladmin -h 127.0.0.1 -uroot -p"${MYSQL_ROOT_PASSWORD}" shutdown; \
     wait $pid || true; \
-    rm -f /docker-entrypoint-initdb.d/01-schema.sql
+    rm -f /docker-entrypoint-initdb.d/01-schema.sql /docker-entrypoint-initdb.d/02-schema-weight.sql

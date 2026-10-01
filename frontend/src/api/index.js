@@ -127,3 +127,30 @@ export const cardAdminApi = {
   reassign: (id, targetAircraftId, operator) =>
     http.post(`/work-cards/${id}/reassign`, { targetAircraftId, operator })
 }
+
+/** 模块八：飞机称重与重心（所有换算/判定都在服务端，前端只提交与展示） */
+export const weightApi = {
+  // 机队基线台账（含“未建立基线”飞机）
+  fleet: () => http.get('/weight/fleet'),
+  // 规则版本
+  rules: (model) => http.get('/weight/rules', { params: model ? { model } : {} }),
+  rule: (id) => http.get(`/weight/rules/${id}`),
+  resolveRule: (model, date) => http.get('/weight/rules/resolve', { params: { model, date } }),
+  createRule: (data) => http.post('/weight/rules', data),
+  updateRule: (data, id) => http.put(`/weight/rules/${id}`, data),
+  publishRule: (id, effectiveDate) =>
+    http.post(`/weight/rules/${id}/publish`, effectiveDate ? { effectiveDate } : {}),
+  // 称重记录
+  weighings: (aircraftId) =>
+    http.get('/weight/weighings', { params: aircraftId ? { aircraftId } : {} }),
+  weighing: (id) => http.get(`/weight/weighings/${id}`),
+  previewWeighing: (data) => http.post('/weight/weighings/preview', data),
+  createWeighing: (data) => http.post('/weight/weighings', data),
+  updateWeighing: (id, data) => http.put(`/weight/weighings/${id}`, data),
+  confirmWeighing: (id, data) => http.post(`/weight/weighings/${id}/confirm`, data),
+  // 构型调整链
+  chain: (aircraftId) => http.get(`/weight/aircraft/${aircraftId}/chain`),
+  version: (id) => http.get(`/weight/versions/${id}`),
+  derive: (data) => http.post('/weight/config/derive', data),
+  compare: (aircraftId, data) => http.post(`/weight/aircraft/${aircraftId}/compare`, data || {})
+}
