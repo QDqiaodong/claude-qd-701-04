@@ -127,3 +127,29 @@ export const cardAdminApi = {
   reassign: (id, targetAircraftId, operator) =>
     http.post(`/work-cards/${id}/reassign`, { targetAircraftId, operator })
 }
+
+/** 模块八：飞机称重与重心（所有换算、判定、版本纪律都在服务端） */
+export const wbApi = {
+  overview: () => http.get('/weight-balance/overview'),
+  fleet: () => http.get('/weight-balance/fleet'),
+  aircraft: (id) => http.get(`/weight-balance/aircraft/${id}`),
+  rules: () => http.get('/weight-balance/rules'),
+  rule: (id) => http.get(`/weight-balance/rules/${id}`),
+  createRule: (data) => http.post('/weight-balance/rules', data),
+  reviseRule: (id, data) => http.post(`/weight-balance/rules/${id}/revise`, data),
+  updateDraft: (id, data) => http.post(`/weight-balance/rules/${id}/draft`, data),
+  publishRule: (id, operator) => http.post(`/weight-balance/rules/${id}/publish`, { operator }),
+  preview: (data) => http.post('/weight-balance/weighings/preview', data),
+  createWeighing: (data) => http.post('/weight-balance/weighings', data),
+  weighings: (aircraftId) =>
+    http.get('/weight-balance/weighings', { params: aircraftId ? { aircraftId } : {} }),
+  weighing: (id) => http.get(`/weight-balance/weighings/${id}`),
+  confirm: (id, data) => http.post(`/weight-balance/weighings/${id}/confirm`, data),
+  setBaseline: (id, operator) => http.post(`/weight-balance/weighings/${id}/baseline`, { operator }),
+  derive: (aircraftId, data) => http.post(`/weight-balance/aircraft/${aircraftId}/config/derive`, data),
+  config: (id) => http.get(`/weight-balance/config/${id}`),
+  diff: (aircraftId, fromId, toId) =>
+    http.get(`/weight-balance/aircraft/${aircraftId}/config/diff`, { params: { fromId, toId } }),
+  events: (aircraftId) =>
+    http.get('/weight-balance/events', { params: aircraftId ? { aircraftId } : {} })
+}

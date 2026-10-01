@@ -56,6 +56,14 @@ SET FOREIGN_KEY_CHECKS = 0;
 CREATE DATABASE IF NOT EXISTS aircraft_mro DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 USE aircraft_mro;
 
+DROP TABLE IF EXISTS wb_event;
+DROP TABLE IF EXISTS wb_config_adjustment;
+DROP TABLE IF EXISTS wb_config_version;
+DROP TABLE IF EXISTS wb_weighing_item;
+DROP TABLE IF EXISTS wb_weighing;
+DROP TABLE IF EXISTS wb_envelope_node;
+DROP TABLE IF EXISTS wb_rule_pivot;
+DROP TABLE IF EXISTS wb_rule_version;
 DROP TABLE IF EXISTS ad_recalc_job_item;
 DROP TABLE IF EXISTS ad_recalc_job;
 DROP TABLE IF EXISTS ad_event;
@@ -859,5 +867,470 @@ INSERT INTO ad_event (directive_id, revision_id, compliance_id, aircraft_id, eve
      'NOT_DUE', 'NEAR_DUE', DATE_SUB(NOW(), INTERVAL 16 DAY)),
     (9, NULL, NULL, NULL, 'REVISION_PUBLISH', 'SYSTEM', 'R1 生效：适用范围扩展为 B737;A320，R0 判断结果与证据保留',
      NULL, NULL, DATE_SUB(NOW(), INTERVAL 15 DAY));
+
+-- ============================================================================
+-- 模块八：飞机称重与重心（Weight & Balance）
+--   wb_rule_version     机型称重规则版本（DRAFT/EFFECTIVE/SUPERSEDED；生效后冻结）
+--   wb_rule_pivot       规则起落架支点臂长（基准点起算，mm）
+--   wb_envelope_node    随重量变化的前/后重心折线节点（节点间线性插值）
+--   wb_weighing         实机称重记录（含统一单位 kg/mm 的结果快照，历史不回算）
+--   wb_weighing_item    支点读数/皮重/燃油/滑油/临时扣补项（保留原文原单位）
+--   wb_config_version   由基线派生的构型版本链（只能从当前版本继续派生）
+--   wb_config_adjustment 构型调整项（重量/臂长/数量/原因/关联工卡）
+--   wb_event            审计事件（append-only）
+--
+-- 验收路径（开箱可点）：
+--   [WB-01] 折线节点之间插值判定：B-6032（1 号机，B737 R1）空重 43800 kg 落在
+--           40000/46000 两节点之间，前边界插值 7380.000、后边界插值 7926.667，CG 7799.543 → 包线内
+--   [WB-02] 后边界越界：B-6032 构型 v1 后货舱加装 3000kg@11800，46800 kg 时 CG 8055.983 > 后边界 8020.000
+--           越界方向=偏后，差值精确 35.983 mm
+--   [WB-03] 前边界越界：构型 v2 拆后舱 + 前电子舱加装 4000kg@1600，47800 kg 时 CG 7280.753 < 前边界 7645.000
+--           越界方向=偏前，差值精确 364.247 mm；v3 拆除后回到 v0，包线内
+--   [WB-04] 公英制往返：B-6688（4 号机）用 lb/in 录入（15873 lb、41281 lb、62.992126 in），
+--           换算 kg/mm 判定，原始读数与原单位保留；切换单位看的是同一批统一值
+--   [WB-05] 重复计算精度：任意称重反复打开/试算，数字完全一致（Decimal 固定精度 HALF_UP，无累积误差）
+--   [WB-06] 旧规则版本追溯：B-9002（14 号机）2025-03-10 引用 B737 R0 称重并已基线；
+--           2025-06-01 R1 生效后 R0 冻结，该基线继续按 R0 当时结果展示，不被 R1 回算覆盖
+--   [WB-07] 构型调整链：B-6032 v0(基线)→v1(偏后)→v2(偏前)→v3(回到包线内)，
+--           只能在 v3（当前）上继续派生；B-6108（2 号机，A320）v0→v1 包线内→v2 偏后 11.165mm→v3 回包线内
+--   [WB-08] 未建立基线：B-6571/B-7411（A330，只有规则无称重）、B-3027（ARJ21，称重缺右读数=无法判定）、
+--           B-11001（ARJ21，从未称重）等在模块中明确标「未建立基线」，不猜默认重心
+--   [WB-09] 超总重：B-11030（20 号机，ARJ21）空重 28340 > 28000，OUTSIDE，超 340.000000 kg，待复核不可基线
+-- ============================================================================
+
+CREATE TABLE wb_rule_version (
+    id             BIGINT       NOT NULL AUTO_INCREMENT,
+    model          VARCHAR(16)  NOT NULL COMMENT '机型：B737 / A320 / A330 / ARJ21',
+    revision_no    VARCHAR(16)  NOT NULL COMMENT '版本号 R0/R1…',
+    status         VARCHAR(16)  NOT NULL COMMENT 'DRAFT 草稿 / EFFECTIVE 生效 / SUPERSEDED 已被取代（冻结）',
+    effective_date DATE         NOT NULL COMMENT '生效日期（按称重日期选择规则）',
+    datum_name     VARCHAR(128) NOT NULL COMMENT '基准点说明',
+    min_weight_kg  DECIMAL(12,6) NOT NULL COMMENT '许用总重下界 kg',
+    max_weight_kg  DECIMAL(12,6) NOT NULL COMMENT '许用总重上界 kg',
+    revision_note  VARCHAR(255) NULL,
+    created_at     DATETIME     NOT NULL,
+    published_at   DATETIME     NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_wb_rule (model, revision_no),
+    KEY idx_wb_rule_status (status)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '称重规则版本';
+
+CREATE TABLE wb_rule_pivot (
+    id               BIGINT       NOT NULL AUTO_INCREMENT,
+    rule_revision_id BIGINT       NOT NULL,
+    pivot_code       VARCHAR(16)  NOT NULL COMMENT 'NOSE / LEFT / RIGHT',
+    pivot_name       VARCHAR(32)  NOT NULL,
+    arm_mm           DECIMAL(12,3) NOT NULL COMMENT '支点臂长（基准点起算 mm）',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_wb_pivot (rule_revision_id, pivot_code)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '称重规则起落架支点';
+
+CREATE TABLE wb_envelope_node (
+    id               BIGINT       NOT NULL AUTO_INCREMENT,
+    rule_revision_id BIGINT       NOT NULL,
+    boundary_kind    VARCHAR(8)   NOT NULL COMMENT 'FRONT 前重心 / AFT 后重心',
+    weight_kg        DECIMAL(12,6) NOT NULL COMMENT '节点重量 kg',
+    arm_mm           DECIMAL(12,3) NOT NULL COMMENT '节点重心臂 mm',
+    PRIMARY KEY (id),
+    KEY idx_wb_node_rule (rule_revision_id, boundary_kind, weight_kg)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '重心包线折线节点';
+
+CREATE TABLE wb_weighing (
+    id               BIGINT       NOT NULL AUTO_INCREMENT,
+    weighing_no      VARCHAR(32)  NOT NULL,
+    aircraft_id      BIGINT       NOT NULL,
+    tail_no          VARCHAR(16)  NOT NULL,
+    model            VARCHAR(16)  NOT NULL,
+    weighing_date    DATE         NOT NULL,
+    scale_no         VARCHAR(32)  NOT NULL COMMENT '秤具编号',
+    rule_revision_id BIGINT       NOT NULL COMMENT '引用规则版本（固化，旧版冻结不改写）',
+    rule_revision_no VARCHAR(16)  NOT NULL,
+    unit_system      VARCHAR(8)   NOT NULL COMMENT 'METRIC / IMPERIAL（各行可自带单位）',
+    fuel_condition   VARCHAR(255) NULL COMMENT '燃油条件说明',
+    oil_condition    VARCHAR(255) NULL COMMENT '滑油条件说明',
+    remark           VARCHAR(255) NULL,
+    status           VARCHAR(16)  NOT NULL COMMENT 'DRAFT 待复核 / CONFIRMED 已复核',
+    weighed_by       VARCHAR(32)  NULL,
+    reviewed_by      VARCHAR(32)  NULL,
+    reviewed_at      DATETIME     NULL,
+    gross_weight_kg  DECIMAL(14,6) NULL COMMENT '毛重（支点净重合计）kg',
+    gross_moment     DECIMAL(18,3) NULL COMMENT '毛重总力矩 kg·mm',
+    final_weight_kg  DECIMAL(14,6) NULL COMMENT '扣补后最终（空重口径）重量 kg',
+    final_moment     DECIMAL(18,3) NULL COMMENT '最终总力矩 kg·mm',
+    cg_arm_mm        DECIMAL(14,3) NULL COMMENT '重心臂 mm',
+    envelope_status  VARCHAR(16)  NOT NULL COMMENT 'INSIDE / OUTSIDE / UNDETERMINED',
+    violation_kind   VARCHAR(16)  NULL COMMENT 'FORWARD/AFT/OVER_WEIGHT/UNDER_WEIGHT',
+    violation_delta  DECIMAL(14,6) NULL COMMENT '越界差值（mm 或 kg）',
+    limit_front_mm   DECIMAL(12,3) NULL COMMENT '判定时前边界（插值）mm',
+    limit_aft_mm     DECIMAL(12,3) NULL COMMENT '判定时后边界（插值）mm',
+    calc_issues      VARCHAR(512) NULL COMMENT '无法判定/越界原因（分号分隔）',
+    baselined_at     DATETIME     NULL,
+    created_at       DATETIME     NOT NULL,
+    updated_at       DATETIME     NOT NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_wb_weighing_no (weighing_no),
+    KEY idx_wb_weighing_aircraft (aircraft_id, weighing_date)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '实机称重记录（结果快照不可回算）';
+
+CREATE TABLE wb_weighing_item (
+    id               BIGINT       NOT NULL AUTO_INCREMENT,
+    weighing_id      BIGINT       NOT NULL,
+    item_type        VARCHAR(16)  NOT NULL COMMENT 'PIVOT/FUEL/OIL/TEMP/CONDITION',
+    pivot_code       VARCHAR(16)  NULL,
+    scale_no         VARCHAR(32)  NULL,
+    item_name        VARCHAR(64)  NULL,
+    gross_reading    VARCHAR(32)  NULL COMMENT '毛读原文（保留）',
+    tare_reading     VARCHAR(32)  NULL COMMENT '皮重原文（保留）',
+    arm_reading      VARCHAR(32)  NULL COMMENT '臂长原文（非支点行）',
+    quantity         INT          NOT NULL DEFAULT 1,
+    weight_unit      VARCHAR(4)   NULL COMMENT 'KG / LB 原单位',
+    length_unit      VARCHAR(4)   NULL COMMENT 'MM / IN 原单位',
+    condition_effect VARCHAR(8)   NULL COMMENT 'ADD 补入 / DEDUCT 扣除',
+    gross_kg         DECIMAL(14,6) NULL COMMENT '统一单位快照',
+    tare_kg          DECIMAL(14,6) NULL,
+    net_kg           DECIMAL(14,6) NULL,
+    arm_mm           DECIMAL(12,3) NULL,
+    reason           VARCHAR(255) NULL,
+    line_no          INT          NOT NULL,
+    PRIMARY KEY (id),
+    KEY idx_wb_item_weighing (weighing_id, line_no)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '称重明细行（原文原单位 + 统一快照）';
+
+CREATE TABLE wb_config_version (
+    id                 BIGINT       NOT NULL AUTO_INCREMENT,
+    aircraft_id        BIGINT       NOT NULL,
+    tail_no            VARCHAR(16)  NOT NULL,
+    model              VARCHAR(16)  NOT NULL,
+    version_no         INT          NOT NULL COMMENT '基线=0，之后 1、2…',
+    kind               VARCHAR(8)   NOT NULL COMMENT 'ROOT / DERIVED',
+    root_weighing_id   BIGINT       NOT NULL,
+    source_weighing_id BIGINT       NULL,
+    parent_version_id  BIGINT       NULL,
+    rule_revision_id   BIGINT       NOT NULL COMMENT '沿链引用基线规则版本',
+    rule_revision_no   VARCHAR(16)  NOT NULL,
+    change_reason      VARCHAR(255) NULL,
+    work_card_no       VARCHAR(32)  NULL,
+    operator_name      VARCHAR(32)  NULL,
+    weight_kg          DECIMAL(14,6) NOT NULL COMMENT '当时重量快照 kg',
+    moment             DECIMAL(18,3) NOT NULL COMMENT '当时力矩快照 kg·mm',
+    cg_arm_mm          DECIMAL(14,3) NOT NULL COMMENT '当时重心臂快照 mm',
+    envelope_status    VARCHAR(16)  NOT NULL,
+    violation_kind     VARCHAR(16)  NULL,
+    violation_delta    DECIMAL(14,6) NULL,
+    limit_front_mm     DECIMAL(12,3) NULL,
+    limit_aft_mm       DECIMAL(12,3) NULL,
+    active_aircraft_id BIGINT       NULL COMMENT '当前版本占位：同机全链唯一非空',
+    created_at         DATETIME     NOT NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_wb_active_config (active_aircraft_id),
+    KEY idx_wb_config_aircraft (aircraft_id, version_no)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '称重庆线派生构型版本（历史快照不回算）';
+
+CREATE TABLE wb_config_adjustment (
+    id               BIGINT       NOT NULL AUTO_INCREMENT,
+    config_version_id BIGINT      NOT NULL,
+    aircraft_id      BIGINT       NOT NULL COMMENT '冗余落库：拒绝跨机并入',
+    action           VARCHAR(8)   NOT NULL COMMENT 'INSTALL 安装 / REMOVE 拆除',
+    item_name        VARCHAR(64)  NOT NULL,
+    weight_reading   VARCHAR(32)  NOT NULL COMMENT '单位重量原文',
+    arm_reading      VARCHAR(32)  NOT NULL COMMENT '臂长原文',
+    weight_unit      VARCHAR(4)   NOT NULL,
+    length_unit      VARCHAR(4)   NOT NULL,
+    quantity         INT          NOT NULL,
+    unit_weight_kg   DECIMAL(14,6) NOT NULL,
+    arm_mm           DECIMAL(12,3) NOT NULL,
+    total_weight_kg  DECIMAL(14,6) NOT NULL,
+    moment           DECIMAL(18,3) NOT NULL,
+    reason           VARCHAR(255) NULL,
+    work_card_no     VARCHAR(32)  NULL,
+    line_no          INT          NOT NULL,
+    PRIMARY KEY (id),
+    KEY idx_wb_adj_version (config_version_id, line_no)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '构型调整项（固化）';
+
+CREATE TABLE wb_event (
+    id                BIGINT       NOT NULL AUTO_INCREMENT,
+    aircraft_id       BIGINT       NULL,
+    event_type        VARCHAR(24)  NOT NULL COMMENT 'RULE_PUBLISH/WEIGHING_CREATE/WEIGHING_CONFIRM/BASELINE_SET/CONFIG_DERIVE',
+    rule_revision_id  BIGINT       NULL,
+    weighing_id       BIGINT       NULL,
+    config_version_id BIGINT       NULL,
+    operator_name     VARCHAR(32)  NOT NULL,
+    detail            VARCHAR(512) NOT NULL,
+    event_at          DATETIME     NOT NULL,
+    PRIMARY KEY (id),
+    KEY idx_wb_event_aircraft (aircraft_id, event_at)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '称重与重心审计事件（append-only）';
+
+-- ----------------------- 模块八种子：称重规则版本 -----------------------
+-- 数字口径：重量 kg(6位) 臂长 mm(3位) HALF_UP；包线是空重口径许用范围。
+
+-- B737：R0（2025-01-01 生效，已冻结）→ R1（2025-06-01 生效，许用范围放大到 48000）
+INSERT INTO wb_rule_version (id, model, revision_no, status, effective_date, datum_name,
+                             min_weight_kg, max_weight_kg, revision_note, created_at, published_at) VALUES
+    (1, 'B737', 'R0', 'SUPERSEDED', DATE '2025-01-01', '机身站位 STA0（机头前 130.000 in 基准面）',
+     40000.000000, 46000.000000, '原版包线；2025-06-01 被 R1 取代，历史称重继续引用本版',
+     DATE '2024-12-20', DATE '2025-01-01'),
+    (2, 'B737', 'R1', 'EFFECTIVE', DATE '2025-06-01', '机身站位 STA0（机头前 130.000 in 基准面）',
+     40000.000000, 48000.000000, 'R1：新增 48000kg 包线节点，许用最大空重由 46000 放宽至 48000；旧称重不回算',
+     DATE '2025-05-20', DATE '2025-06-01'),
+    (3, 'A320', 'R0', 'EFFECTIVE', DATE '2025-01-01', '机身站位 STA0（机头前 100.000 in 基准面）',
+     38000.000000, 46000.000000, '首版', DATE '2024-12-20', DATE '2025-01-01'),
+    (4, 'A330', 'R0', 'SUPERSEDED', DATE '2025-01-01', '机身站位 STA0（机头前 200.000 in 基准面）',
+     100000.000000, 120000.000000, '原版；被 R1 取代', DATE '2024-12-20', DATE '2025-01-01'),
+    (5, 'A330', 'R1', 'EFFECTIVE', DATE '2025-06-01', '机身站位 STA0（机头前 200.000 in 基准面）',
+     100000.000000, 122000.000000, 'R1：放宽最大空重至 122000，基准点不变', DATE '2025-05-20', DATE '2025-06-01'),
+    (6, 'ARJ21', 'R0', 'EFFECTIVE', DATE '2025-01-01', '机身站位 STA0（机头前 80.000 in 基准面）',
+     22000.000000, 28000.000000, '首版', DATE '2024-12-20', DATE '2025-01-01');
+
+-- 支点臂长（mm）
+INSERT INTO wb_rule_pivot (id, rule_revision_id, pivot_code, pivot_name, arm_mm) VALUES
+    (1,  1, 'NOSE',  '前起落架', 1600.000),
+    (2,  1, 'LEFT',  '左主起落架', 9000.000),
+    (3,  1, 'RIGHT', '右主起落架', 9000.000),
+    (4,  2, 'NOSE',  '前起落架', 1600.000),
+    (5,  2, 'LEFT',  '左主起落架', 9000.000),
+    (6,  2, 'RIGHT', '右主起落架', 9000.000),
+    (7,  3, 'NOSE',  '前起落架', 1400.000),
+    (8,  3, 'LEFT',  '左主起落架', 8400.000),
+    (9,  3, 'RIGHT', '右主起落架', 8400.000),
+    (10, 4, 'NOSE',  '前起落架', 2000.000),
+    (11, 4, 'LEFT',  '左主起落架', 11000.000),
+    (12, 4, 'RIGHT', '右主起落架', 11000.000),
+    (13, 5, 'NOSE',  '前起落架', 2000.000),
+    (14, 5, 'LEFT',  '左主起落架', 11000.000),
+    (15, 5, 'RIGHT', '右主起落架', 11000.000),
+    (16, 6, 'NOSE',  '前起落架', 1200.000),
+    (17, 6, 'LEFT',  '左主起落架', 7200.000),
+    (18, 6, 'RIGHT', '右主起落架', 7200.000);
+
+-- 包线折线节点（kg, mm）
+INSERT INTO wb_envelope_node (id, rule_revision_id, boundary_kind, weight_kg, arm_mm) VALUES
+    -- B737 R0
+    (1,  1, 'FRONT', 40000.000000, 7000.000),
+    (2,  1, 'FRONT', 46000.000000, 7600.000),
+    (3,  1, 'AFT',   40000.000000, 7800.000),
+    (4,  1, 'AFT',   46000.000000, 8000.000),
+    -- B737 R1（新增 48000 节点）
+    (5,  2, 'FRONT', 40000.000000, 7000.000),
+    (6,  2, 'FRONT', 46000.000000, 7600.000),
+    (7,  2, 'FRONT', 48000.000000, 7650.000),
+    (8,  2, 'AFT',   40000.000000, 7800.000),
+    (9,  2, 'AFT',   46000.000000, 8000.000),
+    (10, 2, 'AFT',   48000.000000, 8050.000),
+    -- A320 R0
+    (11, 3, 'FRONT', 38000.000000, 6500.000),
+    (12, 3, 'FRONT', 44000.000000, 7100.000),
+    (13, 3, 'FRONT', 46000.000000, 7150.000),
+    (14, 3, 'AFT',   38000.000000, 7600.000),
+    (15, 3, 'AFT',   44000.000000, 7900.000),
+    (16, 3, 'AFT',   46000.000000, 7950.000),
+    -- A330 R0
+    (17, 4, 'FRONT', 100000.000000, 9000.000),
+    (18, 4, 'FRONT', 120000.000000, 9800.000),
+    (19, 4, 'AFT',   100000.000000, 10500.000),
+    (20, 4, 'AFT',   120000.000000, 11000.000),
+    -- A330 R1
+    (21, 5, 'FRONT', 100000.000000, 9000.000),
+    (22, 5, 'FRONT', 120000.000000, 9800.000),
+    (23, 5, 'FRONT', 122000.000000, 9850.000),
+    (24, 5, 'AFT',   100000.000000, 10500.000),
+    (25, 5, 'AFT',   120000.000000, 11000.000),
+    (26, 5, 'AFT',   122000.000000, 11050.000),
+    -- ARJ21 R0
+    (27, 6, 'FRONT', 22000.000000, 6200.000),
+    (28, 6, 'FRONT', 27000.000000, 6700.000),
+    (29, 6, 'FRONT', 28000.000000, 6750.000),
+    (30, 6, 'AFT',   22000.000000, 7100.000),
+    (31, 6, 'AFT',   27000.000000, 7400.000),
+    (32, 6, 'AFT',   28000.000000, 7450.000);
+
+-- ----------------------- 模块八种子：实机称重记录 -----------------------
+-- 计算明细（tools/wb_seed_calc.py 为计算底稿）：
+--   B-9002（14）R0 历史基线：毛 42650/325390000 → 扣油 850 → 41800 kg，CG 7618.182；
+--   B-6032（1）R1 公制基线：毛 44650/348570000 → 43800 kg，CG 7799.543（节点间插值）；
+--   B-6688（4）R1 英制称重（lb/in）：毛 44649.364941 → 43799.227900 kg，CG 7799.549；
+--   B-6108（2）A320 基线：毛 41600 → 40860 kg，CG 7661.087；
+--   B-11030（20）ARJ21：28340 > 28000，超 340.000000 kg，待复核；
+--   B-3027（6）ARJ21：缺右主起读数 → UNDETERMINED（不能给包线结论）。
+
+INSERT INTO wb_weighing (id, weighing_no, aircraft_id, tail_no, model, weighing_date, scale_no,
+                         rule_revision_id, rule_revision_no, unit_system, fuel_condition, oil_condition,
+                         remark, status, weighed_by, reviewed_by, reviewed_at,
+                         gross_weight_kg, gross_moment, final_weight_kg, final_moment, cg_arm_mm,
+                         envelope_status, violation_kind, violation_delta, limit_front_mm, limit_aft_mm,
+                         calc_issues, baselined_at, created_at, updated_at) VALUES
+    -- WB-01/06 B-9002：R0 历史称重，已复核已基线（R1 发布后结果冻结）
+    (1, 'WB-20250310-001', 14, 'B-9002', 'B737', DATE '2025-03-10', 'SCALE-SET-B737-01',
+     1, 'R0', 'METRIC', '左右主油箱各 400 kg，共 800 kg（求空重扣除）', '发动机滑油 50 kg（求空重扣除）',
+     '机库水平姿态称重在 R0 规则有效期内完成', 'CONFIRMED', '陈志强', '罗建军', DATE '2025-03-11',
+     42650.000000, 325390000.000, 41800.000000, 318440000.000, 7618.182,
+     'INSIDE', NULL, NULL, 7180.000, 7860.000, NULL, DATE '2025-03-11', DATE '2025-03-10', DATE '2025-03-11'),
+    -- WB-01 B-6032：公制，已复核已基线 v0，构型链演示母本
+    (2, 'WB-20260910-001', 1, 'B-6032', 'B737', DATE '2026-09-10', 'SCALE-SET-B737-02',
+     2, 'R1', 'METRIC', '左右主油箱各 400 kg，共 800 kg', '发动机滑油 50 kg',
+     '空重口径称重，现场三秤校准合格', 'CONFIRMED', '陈志强', '罗建军', DATE '2026-09-11',
+     44650.000000, 348570000.000, 43800.000000, 341620000.000, 7799.543,
+     'INSIDE', NULL, NULL, 7380.000, 7926.667, NULL, DATE '2026-09-11', DATE '2026-09-10', DATE '2026-09-11'),
+    -- WB-04 B-6688：英制录入，已复核已基线；数字与公制基线物理量级一致
+    (3, 'WB-20260912-001', 4, 'B-6688', 'B737', DATE '2026-09-12', 'SCALE-SET-LB-07',
+     2, 'R1', 'IMPERIAL', '共 1764 lb（约 800.137 kg）', '110 lb（约 49.895 kg）',
+     '英制秤组称重，臂长以钢卷尺英寸读数录入', 'CONFIRMED', '王大鹏', '周国平', DATE '2026-09-13',
+     44649.364941, 348565233.970, 43799.332839, 341614928.798, 7799.546,
+     'INSIDE', NULL, NULL, 7379.933, 7926.644, NULL, DATE '2026-09-13', DATE '2026-09-12', DATE '2026-09-13'),
+    -- B-6108：A320 基线
+    (4, 'WB-20260908-001', 2, 'B-6108', 'A320', DATE '2026-09-08', 'SCALE-SET-A320-01',
+     3, 'R0', 'METRIC', '剩余燃油 700 kg', '滑油 40 kg',
+     '定检后空重称重', 'CONFIRMED', '孙立伟', '罗建军', DATE '2026-09-09',
+     41600.000000, 318640000.000, 40860.000000, 313032000.000, 7661.087,
+     'INSIDE', NULL, NULL, 6786.000, 7743.000, NULL, DATE '2026-09-09', DATE '2026-09-08', DATE '2026-09-09'),
+    -- WB-09 B-11030：超总重，待复核（不能成为基线）
+    (5, 'WB-20260915-001', 20, 'B-11030', 'ARJ21', DATE '2026-09-15', 'SCALE-SET-ARJ-02',
+     6, 'R0', 'METRIC', '剩余燃油 220 kg', '滑油 40 kg',
+     '加装高原构型设备后首次称重，疑似超重', 'DRAFT', '钱明亮', NULL, NULL,
+     28600.000000, 187320000.000, 28340.000000, 185568000.000, 6547.918,
+     'OUTSIDE', 'OVER_WEIGHT', 340.000000, NULL, NULL,
+     '扣补后最终重量超出许用总重上界', NULL, DATE '2026-09-15', DATE '2026-09-15'),
+    -- WB-08 B-3027：缺右主起读数 → UNDETERMINED，待复核
+    (6, 'WB-20260916-001', 6, 'B-3027', 'ARJ21', DATE '2026-09-16', 'SCALE-SET-ARJ-01',
+     6, 'R0', 'METRIC', '剩余燃油 180 kg', '滑油 30 kg',
+     '右秤通讯故障读数缺失，先登记待补测', 'DRAFT', '赵岩', NULL, NULL,
+     14820.000000, 89784000.000, 14610.000000, 88410000.000, 6051.335,
+     'UNDETERMINED', NULL, NULL, NULL, NULL,
+     '支点「RIGHT」毛读数缺失；规则支点「RIGHT」缺少称重读数', NULL, DATE '2026-09-16', DATE '2026-09-16');
+
+-- 支点/条件明细（原文原单位 + kg/mm 快照）
+INSERT INTO wb_weighing_item (id, weighing_id, item_type, pivot_code, scale_no, item_name,
+                              gross_reading, tare_reading, arm_reading, quantity, weight_unit, length_unit,
+                              condition_effect, gross_kg, tare_kg, net_kg, arm_mm, reason, line_no) VALUES
+    -- 1) B-9002 R0
+    (1,  1, 'PIVOT', 'NOSE',  'SC-N-11', NULL, '7900', '0', NULL, 1, 'KG', 'MM', NULL, 7900.000000, 0.000000, 7900.000000, 1600.000, NULL, 1),
+    (2,  1, 'PIVOT', 'LEFT',  'SC-M-21', NULL, '17375', '0', NULL, 1, 'KG', 'MM', NULL, 17375.000000, 0.000000, 17375.000000, 9000.000, NULL, 2),
+    (3,  1, 'PIVOT', 'RIGHT', 'SC-M-22', NULL, '17375', '0', NULL, 1, 'KG', 'MM', NULL, 17375.000000, 0.000000, 17375.000000, 9000.000, NULL, 3),
+    (4,  1, 'FUEL', NULL, NULL, '左右主油箱剩余燃油', '800', '0', '8200', 1, 'KG', 'MM', 'DEDUCT', 800.000000, 0.000000, 800.000000, 8200.000, '求空重扣除机上燃油', 4),
+    (5,  1, 'OIL',  NULL, NULL, '发动机滑油', '50', '0', '7800', 1, 'KG', 'MM', 'DEDUCT', 50.000000, 0.000000, 50.000000, 7800.000, '求空重扣除滑油', 5),
+    -- 2) B-6032 R1 metric
+    (6,  2, 'PIVOT', 'NOSE',  'SC-N-12', NULL, '7200', '0', NULL, 1, 'KG', 'MM', NULL, 7200.000000, 0.000000, 7200.000000, 1600.000, NULL, 1),
+    (7,  2, 'PIVOT', 'LEFT',  'SC-M-23', NULL, '18725', '0', NULL, 1, 'KG', 'MM', NULL, 18725.000000, 0.000000, 18725.000000, 9000.000, NULL, 2),
+    (8,  2, 'PIVOT', 'RIGHT', 'SC-M-24', NULL, '18725', '0', NULL, 1, 'KG', 'MM', NULL, 18725.000000, 0.000000, 18725.000000, 9000.000, NULL, 3),
+    (9,  2, 'FUEL', NULL, NULL, '左右主油箱剩余燃油', '800', '0', '8200', 1, 'KG', 'MM', 'DEDUCT', 800.000000, 0.000000, 800.000000, 8200.000, '求空重扣除机上燃油', 4),
+    (10, 2, 'OIL',  NULL, NULL, '发动机滑油', '50', '0', '7800', 1, 'KG', 'MM', 'DEDUCT', 50.000000, 0.000000, 50.000000, 7800.000, '求空重扣除滑油', 5),
+    -- 3) B-6688 imperial（lb/in 原文；kg/mm 快照）
+    (11, 3, 'PIVOT', 'NOSE',  'SC-LB-31', NULL, '15873', '0', NULL, 1, 'LB', 'IN', NULL, 7199.871689, 0.000000, 7199.871689, 1600.000, NULL, 1),
+    (12, 3, 'PIVOT', 'LEFT',  'SC-LB-32', NULL, '41281', '0', NULL, 1, 'LB', 'IN', NULL, 18724.746626, 0.000000, 18724.746626, 9000.000, NULL, 2),
+    (13, 3, 'PIVOT', 'RIGHT', 'SC-LB-33', NULL, '41281', '0', NULL, 1, 'LB', 'IN', NULL, 18724.746626, 0.000000, 18724.746626, 9000.000, NULL, 3),
+    (14, 3, 'FUEL', NULL, NULL, '机上剩余燃油', '1764', '0', '322.834646', 1, 'LB', 'IN', 'DEDUCT', 800.136941, 0.000000, 800.136941, 8200.000, '求空重扣除机上燃油', 4),
+    (15, 3, 'OIL',  NULL, NULL, '发动机滑油', '110', '0', '307.086614', 1, 'LB', 'IN', 'DEDUCT', 49.895161, 0.000000, 49.895161, 7800.000, '求空重扣除滑油', 5),
+    -- 4) B-6108 A320
+    (16, 4, 'PIVOT', 'NOSE',  'SC-N-41', NULL, '4400', '0', NULL, 1, 'KG', 'MM', NULL, 4400.000000, 0.000000, 4400.000000, 1400.000, NULL, 1),
+    (17, 4, 'PIVOT', 'LEFT',  'SC-M-42', NULL, '18600', '0', NULL, 1, 'KG', 'MM', NULL, 18600.000000, 0.000000, 18600.000000, 8400.000, NULL, 2),
+    (18, 4, 'PIVOT', 'RIGHT', 'SC-M-43', NULL, '18600', '0', NULL, 1, 'KG', 'MM', NULL, 18600.000000, 0.000000, 18600.000000, 8400.000, NULL, 3),
+    (19, 4, 'FUEL', NULL, NULL, '机上剩余燃油', '700', '0', '7600', 1, 'KG', 'MM', 'DEDUCT', 700.000000, 0.000000, 700.000000, 7600.000, '求空重扣除机上燃油', 4),
+    (20, 4, 'OIL',  NULL, NULL, '发动机滑油', '40', '0', '7200', 1, 'KG', 'MM', 'DEDUCT', 40.000000, 0.000000, 40.000000, 7200.000, '求空重扣除滑油', 5),
+    -- 5) B-11030 ARJ21 超总重（待复核）
+    (21, 5, 'PIVOT', 'NOSE',  'SC-A-51', NULL, '3100', '0', NULL, 1, 'KG', 'MM', NULL, 3100.000000, 0.000000, 3100.000000, 1200.000, NULL, 1),
+    (22, 5, 'PIVOT', 'LEFT',  'SC-A-52', NULL, '12750', '0', NULL, 1, 'KG', 'MM', NULL, 12750.000000, 0.000000, 12750.000000, 7200.000, NULL, 2),
+    (23, 5, 'PIVOT', 'RIGHT', 'SC-A-53', NULL, '12750', '0', NULL, 1, 'KG', 'MM', NULL, 12750.000000, 0.000000, 12750.000000, 7200.000, NULL, 3),
+    (24, 5, 'FUEL', NULL, NULL, '机上剩余燃油', '220', '0', '6800', 1, 'KG', 'MM', 'DEDUCT', 220.000000, 0.000000, 220.000000, 6800.000, '求空重扣除机上燃油', 4),
+    (25, 5, 'OIL',  NULL, NULL, '发动机滑油', '40', '0', '6400', 1, 'KG', 'MM', 'DEDUCT', 40.000000, 0.000000, 40.000000, 6400.000, '求空重扣除滑油', 5),
+    -- 6) B-3027 ARJ21 缺右读数（RIGHT 行不存在）
+    (26, 6, 'PIVOT', 'NOSE', 'SC-A-61', NULL, '2820', '0', NULL, 1, 'KG', 'MM', NULL, 2820.000000, 0.000000, 2820.000000, 1200.000, NULL, 1),
+    (27, 6, 'PIVOT', 'LEFT', 'SC-A-62', NULL, '12000', '0', NULL, 1, 'KG', 'MM', NULL, 12000.000000, 0.000000, 12000.000000, 7200.000, NULL, 2),
+    (28, 6, 'FUEL', NULL, NULL, '机上剩余燃油', '180', '0', '6600', 1, 'KG', 'MM', 'DEDUCT', 180.000000, 0.000000, 180.000000, 6600.000, '求空重扣除机上燃油', 3),
+    (29, 6, 'OIL',  NULL, NULL, '发动机滑油', '30', '0', '6200', 1, 'KG', 'MM', 'DEDUCT', 30.000000, 0.000000, 30.000000, 6200.000, '求空重扣除滑油', 4);
+
+-- 注意 B-3027 表头的毛重/最终重量只汇总了现有支点与扣补（右读数缺失，结论 UNDETERMINED）。
+
+-- ----------------------- 模块八种子：构型版本链与调整项 -----------------------
+-- B-9002：v0（R0 基线，冻结展示）
+INSERT INTO wb_config_version (id, aircraft_id, tail_no, model, version_no, kind, root_weighing_id,
+                               source_weighing_id, parent_version_id, rule_revision_id, rule_revision_no,
+                               change_reason, work_card_no, operator_name,
+                               weight_kg, moment, cg_arm_mm, envelope_status, violation_kind, violation_delta,
+                               limit_front_mm, limit_aft_mm, active_aircraft_id, created_at) VALUES
+    (1, 14, 'B-9002', 'B737', 0, 'ROOT', 1, 1, NULL, 1, 'R0', '称重基线：WB-20250310-001', NULL, '罗建军',
+     41800.000000, 318440000.000, 7618.182, 'INSIDE', NULL, NULL, 7180.000, 7860.000, 14, DATE '2025-03-11'),
+    -- B-6032：v0 基线 → v1 偏后 → v2 偏前 → v3 回包线内（当前）
+    (2, 1, 'B-6032', 'B737', 0, 'ROOT', 2, 2, NULL, 2, 'R1', '称重基线：WB-20260910-001', NULL, '罗建军',
+     43800.000000, 341620000.000, 7799.543, 'INSIDE', NULL, NULL, 7380.000, 7926.667, NULL, DATE '2026-09-11'),
+    (3, 1, 'B-6032', 'B737', 1, 'DERIVED', 2, NULL, 2, 2, 'R1',
+     '后货舱加装卫星通讯天线及底座', 'WC-2026-0301', '刘振华',
+     46800.000000, 377020000.000, 8055.983, 'OUTSIDE', 'AFT', 35.983000, 7620.000, 8020.000, NULL, DATE '2026-09-18'),
+    (4, 1, 'B-6032', 'B737', 2, 'DERIVED', 2, NULL, 3, 2, 'R1',
+     '拆除后货舱天线，前电子舱加装客舱网络机柜（工卡合并改版）', 'WC-2026-0302', '刘振华',
+     47800.000000, 348020000.000, 7280.753, 'OUTSIDE', 'FORWARD', 364.247000, 7645.000, 8045.000, NULL, DATE '2026-09-22'),
+    (5, 1, 'B-6032', 'B737', 3, 'DERIVED', 2, NULL, 4, 2, 'R1',
+     '拆除前电子舱网络机柜，恢复基线布局', 'WC-2026-0303', '刘振华',
+     43800.000000, 341620000.000, 7799.543, 'INSIDE', NULL, NULL, 7380.000, 7926.667, 1, DATE '2026-09-26'),
+    -- B-6688：v0 英制称重基线（当前）
+    (6, 4, 'B-6688', 'B737', 0, 'ROOT', 3, 3, NULL, 2, 'R1', '称重基线：WB-20260912-001', NULL, '周国平',
+     43799.332839, 341614928.798, 7799.546, 'INSIDE', NULL, NULL, 7379.933, 7926.644, 4, DATE '2026-09-13'),
+    -- B-6108（A320）：v0 → v1 包线内 → v2 偏后 11.165mm → v3 回包线内（当前）
+    (7, 2, 'B-6108', 'A320', 0, 'ROOT', 4, 4, NULL, 3, 'R0', '称重基线：WB-20260908-001', NULL, '罗建军',
+     40860.000000, 313032000.000, 7661.087, 'INSIDE', NULL, NULL, 6786.000, 7743.000, NULL, DATE '2026-09-09'),
+    (8, 2, 'B-6108', 'A320', 1, 'DERIVED', 4, NULL, 7, 3, 'R0',
+     '客舱加装卫星通讯调制解调器 2 台', 'WC-2026-0311', '陈志强',
+     41060.000000, 315032000.000, 7672.479, 'INSIDE', NULL, NULL, 6806.000, 7753.000, NULL, DATE '2026-09-14'),
+    (9, 2, 'B-6108', 'A320', 2, 'DERIVED', 4, NULL, 8, 3, 'R0',
+     '后货舱加装集装器约束与货运套件', 'WC-2026-0312', '陈志强',
+     44060.000000, 348632000.000, 7912.665, 'OUTSIDE', 'AFT', 11.165000, 7101.500, 7901.500, NULL, DATE '2026-09-20'),
+    (10, 2, 'B-6108', 'A320', 3, 'DERIVED', 4, NULL, 9, 3, 'R0',
+     '货运套件改装方案取消，拆除恢复 v1 布局', 'WC-2026-0313', '陈志强',
+     41060.000000, 315032000.000, 7672.479, 'INSIDE', NULL, NULL, 6806.000, 7753.000, 2, DATE '2026-09-25');
+
+-- 构型调整项（每个 DERIVED 版本的完整调整链保留）
+INSERT INTO wb_config_adjustment (id, config_version_id, aircraft_id, action, item_name,
+                                  weight_reading, arm_reading, weight_unit, length_unit, quantity,
+                                  unit_weight_kg, arm_mm, total_weight_kg, moment, reason, work_card_no, line_no) VALUES
+    -- v1 B-6032：后货舱天线 3000 kg @ 11800
+    (1, 3, 1, 'INSTALL', '卫星通讯天线及底座', '3000', '11800', 'KG', 'MM', 1,
+     3000.000000, 11800.000, 3000.000000, 35400000.000, '后货舱加装卫星通讯天线及底座', 'WC-2026-0301', 1),
+    -- v2 B-6032：拆 3000@11800 + 装 4000@1600
+    (2, 4, 1, 'REMOVE', '卫星通讯天线及底座', '3000', '11800', 'KG', 'MM', 1,
+     3000.000000, 11800.000, 3000.000000, -35400000.000, '方案改版拆除', 'WC-2026-0302', 1),
+    (3, 4, 1, 'INSTALL', '前电子舱客舱网络机柜', '4000', '1600', 'KG', 'MM', 1,
+     4000.000000, 1600.000, 4000.000000, 6400000.000, '前电子舱加装客舱网络机柜', 'WC-2026-0302', 2),
+    -- v3 B-6032：拆 4000@1600
+    (4, 5, 1, 'REMOVE', '前电子舱客舱网络机柜', '4000', '1600', 'KG', 'MM', 1,
+     4000.000000, 1600.000, 4000.000000, -6400000.000, '恢复基线布局', 'WC-2026-0303', 1),
+    -- B-6108 v1：2 x 100 kg @ 10000
+    (5, 8, 2, 'INSTALL', '卫星通讯调制解调器', '100', '10000', 'KG', 'MM', 2,
+     100.000000, 10000.000, 200.000000, 2000000.000, '客舱加装卫星通讯调制解调器 2 台', 'WC-2026-0311', 1),
+    -- B-6108 v2：3000 kg @ 11200
+    (6, 9, 2, 'INSTALL', '后货舱货运套件', '3000', '11200', 'KG', 'MM', 1,
+     3000.000000, 11200.000, 3000.000000, 33600000.000, '后货舱加装集装器约束与货运套件', 'WC-2026-0312', 1),
+    -- B-6108 v3：拆除 v2 的 3000@11200
+    (7, 10, 2, 'REMOVE', '后货舱货运套件', '3000', '11200', 'KG', 'MM', 1,
+     3000.000000, 11200.000, 3000.000000, -33600000.000, '改装方案取消拆除', 'WC-2026-0313', 1);
+
+-- 审计事件（append-only 种子）
+INSERT INTO wb_event (id, aircraft_id, event_type, rule_revision_id, weighing_id, config_version_id,
+                      operator_name, detail, event_at) VALUES
+    (1, NULL, 'RULE_PUBLISH', 1, NULL, NULL, 'SYSTEM', '机型 B737 称重规则 R0 生效', DATE '2025-01-01'),
+    (2, 14, 'WEIGHING_CREATE', 1, 1, NULL, '陈志强', '登记称重 WB-20250310-001（B-9002，引用规则 R0），判定：包线内', DATE '2025-03-10'),
+    (3, 14, 'WEIGHING_CONFIRM', 1, 1, NULL, '罗建军', '称重 WB-20250310-001 经 罗建军 复核确认，判定：包线内', DATE '2025-03-11'),
+    (4, 14, 'BASELINE_SET', 1, 1, 1, '罗建军', '称重 WB-20250310-001 成为 B-9002 当前称重基线（构型 v0）', DATE '2025-03-11'),
+    (5, NULL, 'RULE_PUBLISH', 2, NULL, NULL, 'SYSTEM',
+     '机型 B737 称重规则 R1 生效，旧版 R0 转冻结；B-9002 历史基线继续按 R0 结果展示，不回算', DATE '2025-06-01'),
+    (6, NULL, 'RULE_PUBLISH', 5, NULL, NULL, 'SYSTEM', '机型 A330 称重规则 R1 生效，旧版 R0 转冻结', DATE '2025-06-01'),
+    (7, 1, 'WEIGHING_CREATE', 2, 2, NULL, '陈志强', '登记称重 WB-20260910-001（B-6032，引用规则 R1），判定：包线内', DATE '2026-09-10'),
+    (8, 1, 'WEIGHING_CONFIRM', 2, 2, NULL, '罗建军', '称重 WB-20260910-001 经 罗建军 复核确认，判定：包线内', DATE '2026-09-11'),
+    (9, 1, 'BASELINE_SET', 2, 2, 2, '罗建军', '称重 WB-20260910-001 成为 B-6032 当前称重基线（构型 v0）', DATE '2026-09-11'),
+    (10, 1, 'CONFIG_DERIVE', 2, NULL, 3, '刘振华',
+     '由构型 v0 派生 v1（1 项调整，工卡 WC-2026-0301），判定：包线外；越界方向：偏后，差值 35.983 mm', DATE '2026-09-18'),
+    (11, 1, 'CONFIG_DERIVE', 2, NULL, 4, '刘振华',
+     '由构型 v1 派生 v2（2 项调整，工卡 WC-2026-0302），判定：包线外；越界方向：偏前，差值 364.247 mm', DATE '2026-09-22'),
+    (12, 1, 'CONFIG_DERIVE', 2, NULL, 5, '刘振华',
+     '由构型 v2 派生 v3（1 项调整，工卡 WC-2026-0303），拆除前电子舱机柜恢复基线，判定：包线内（当前版本）', DATE '2026-09-26'),
+    (13, 4, 'WEIGHING_CREATE', 2, 3, NULL, '王大鹏', '登记称重 WB-20260912-001（B-6688，lb/in 英制，引用规则 R1），判定：包线内', DATE '2026-09-12'),
+    (14, 4, 'WEIGHING_CONFIRM', 2, 3, NULL, '周国平', '称重 WB-20260912-001 经 周国平 复核确认，判定：包线内', DATE '2026-09-13'),
+    (15, 4, 'BASELINE_SET', 2, 3, 6, '周国平', '称重 WB-20260912-001 成为 B-6688 当前称重基线（构型 v0，原始单位 lb/in 保留）', DATE '2026-09-13'),
+    (16, 2, 'WEIGHING_CREATE', 3, 4, NULL, '孙立伟', '登记称重 WB-20260908-001（B-6108，引用规则 R0），判定：包线内', DATE '2026-09-08'),
+    (17, 2, 'BASELINE_SET', 3, 4, 7, '罗建军', '称重 WB-20260908-001 成为 B-6108 当前称重基线（构型 v0）', DATE '2026-09-09'),
+    (18, 2, 'CONFIG_DERIVE', 3, NULL, 8, '陈志强', '由构型 v0 派生 v1（1 项调整 2 台，工卡 WC-2026-0311），判定：包线内', DATE '2026-09-14'),
+    (19, 2, 'CONFIG_DERIVE', 3, NULL, 9, '陈志强', '由构型 v1 派生 v2（工卡 WC-2026-0312），判定：包线外；越界方向：偏后，差值 11.165 mm', DATE '2026-09-20'),
+    (20, 2, 'CONFIG_DERIVE', 3, NULL, 10, '陈志强', '由构型 v2 派生 v3（工卡 WC-2026-0313），拆除货运套件，判定：包线内（当前版本）', DATE '2026-09-25'),
+    (21, 20, 'WEIGHING_CREATE', 6, 5, NULL, '钱明亮', '登记称重 WB-20260915-001（B-11030），判定：包线外；超过许用总重上界 340 kg', DATE '2026-09-15'),
+    (22, 6, 'WEIGHING_CREATE', 6, 6, NULL, '赵岩', '登记称重 WB-20260916-001（B-3027），右主起读数缺失，判定：无法判定', DATE '2026-09-16');
 
 SET FOREIGN_KEY_CHECKS = 1;

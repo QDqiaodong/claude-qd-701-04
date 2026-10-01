@@ -42,6 +42,13 @@
         <div class="stat-chip" :class="{ 'is-alert': (adOverview.pending || 0) > 0 }">
           <b>{{ adOverview.pending || 0 }}</b><span>AD 待核实</span>
         </div>
+        <div class="stat-chip" :class="{ 'is-alert': (wbOverview.outsideCount || 0) > 0 }">
+          <b>{{ wbOverview.outsideCount || 0 }}</b><span>称重包线外</span>
+        </div>
+        <div class="stat-chip" :class="{ 'is-alert': (wbOverview.noBaselineCount || 0) > 0 }">
+          <b>{{ wbOverview.noBaselineCount || 0 }}</b><span>未建立称重基线</span>
+        </div>
+        <div class="stat-chip"><b>{{ wbOverview.baselineCount || 0 }}</b><span>称重基线</span></div>
         <div class="stat-chip" :class="{ 'is-alert': (overview.partLow || 0) > 0 }">
           <b>{{ overview.partLow || 0 }}</b><span>低库存件</span>
         </div>
@@ -73,7 +80,7 @@
 import { computed, getCurrentInstance, onMounted, provide, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import router, { navItems } from './router'
-import { aircraftApi, hangarApi, releaseApi, adApi } from './api'
+import { aircraftApi, hangarApi, releaseApi, adApi, wbApi } from './api'
 
 /**
  * 模板自带的 main.js 只装了 Element Plus，没装 router（那份文件不动它），
@@ -90,6 +97,7 @@ const aircraftId = ref(null)
 const overview = ref({})
 const releaseOverview = ref({})
 const adOverview = ref({})
+const wbOverview = ref({})
 
 /**
  * 全局机号上下文：所有页面 inject('mro') 拿同一架飞机，
@@ -101,6 +109,7 @@ const mro = {
   overview,
   releaseOverview,
   adOverview,
+  wbOverview,
   refreshOverview: loadOverview,
   refreshReleaseOverview: loadReleaseOverview,
   refreshAdOverview: loadAdOverview,
@@ -148,9 +157,13 @@ async function loadAdOverview() {
   adOverview.value = await adApi.overview()
 }
 
+async function loadWbOverview() {
+  wbOverview.value = await wbApi.overview()
+}
+
 onMounted(async () => {
   await loadAircraft()
-  await Promise.all([loadOverview(), loadReleaseOverview(), loadAdOverview()])
+  await Promise.all([loadOverview(), loadReleaseOverview(), loadAdOverview(), loadWbOverview()])
 })
 
 // 从其他模块回到本页时自动刷新 AD 计数（如登记飞行、工卡变化后）

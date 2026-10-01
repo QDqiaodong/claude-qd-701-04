@@ -531,4 +531,253 @@ public final class Views {
             long complied,
             long runningJobCount) {
     }
+
+    // ============================ 模块八：飞机称重与重心 ============================
+
+    /** 支点（统一 kg/mm，另附原单位展示换算） */
+    public record WbPivotView(
+            String code,
+            String name,
+            BigDecimal armMm) {
+    }
+
+    /** 包线折线节点 */
+    public record WbNodeView(
+            String kind,
+            BigDecimal weightKg,
+            BigDecimal armMm) {
+    }
+
+    /** 称重规则版本 */
+    public record WbRuleView(
+            Long id,
+            String model,
+            String revisionNo,
+            String status,
+            String statusName,
+            LocalDate effectiveDate,
+            String datumName,
+            BigDecimal minWeightKg,
+            BigDecimal maxWeightKg,
+            String revisionNote,
+            List<WbPivotView> pivots,
+            List<WbNodeView> frontNodes,
+            List<WbNodeView> aftNodes,
+            LocalDateTime createdAt,
+            LocalDateTime publishedAt,
+            boolean current) {
+    }
+
+    /** 称重明细行：原始读数/原单位与统一单位快照并列 */
+    public record WbItemView(
+            Long id,
+            String itemType,
+            String pivotCode,
+            String scaleNo,
+            String itemName,
+            String grossReading,
+            String tareReading,
+            String armReading,
+            Integer quantity,
+            String weightUnit,
+            String lengthUnit,
+            String effect,
+            String reason,
+            Integer lineNo,
+            // 统一单位
+            BigDecimal grossKg,
+            BigDecimal tareKg,
+            BigDecimal netKg,
+            BigDecimal armMm,
+            BigDecimal moment) {
+    }
+
+    /** 试算结果（不落库），同时返回原始单位与统一单位两套数字，对应同一计算事实 */
+    public record WbCalcView(
+            List<WbItemView> items,
+            List<WbPivotNet> pivotNets,
+            List<WbCorrectionView> corrections,
+            String grossWeightKg,
+            String grossWeightLb,
+            String grossMoment,
+            String finalWeightKg,
+            String finalWeightLb,
+            String finalMoment,
+            String cgArmMm,
+            String cgArmIn,
+            String envelopeStatus,
+            String envelopeStatusName,
+            String violationKind,
+            String violationKindName,
+            String violationDelta,
+            String violationUnit,
+            String limitFrontMm,
+            String limitAftMm,
+            String limitFrontIn,
+            String limitAftIn,
+            List<String> issues) {
+    }
+
+    public record WbPivotNet(
+            String pivotCode,
+            String scaleNo,
+            String netKg,
+            String netLb,
+            String armMm,
+            String armIn,
+            String moment) {
+    }
+
+    public record WbCorrectionView(
+            String itemType,
+            String itemName,
+            String effect,
+            Integer quantity,
+            String totalWeightKg,
+            String totalWeightLb,
+            String armMm,
+            String armIn,
+            String signedMoment) {
+    }
+
+    /** 称重记录列表行 */
+    public record WbWeighingView(
+            Long id,
+            String weighingNo,
+            Long aircraftId,
+            String tailNo,
+            String model,
+            LocalDate weighingDate,
+            String scaleNo,
+            Long ruleRevisionId,
+            String ruleRevisionNo,
+            String unitSystem,
+            String status,
+            String statusName,
+            String weighedBy,
+            String reviewedBy,
+            String finalWeightKg,
+            String cgArmMm,
+            String envelopeStatus,
+            String envelopeStatusName,
+            String violationKindName,
+            String violationDelta,
+            boolean baseline,
+            LocalDateTime reviewedAt,
+            LocalDateTime createdAt) {
+    }
+
+    /** 称重记录详情（含明细行 + 计算快照） */
+    public record WbWeighingDetailView(
+            WbWeighingView header,
+            String fuelCondition,
+            String oilCondition,
+            String remark,
+            List<WbItemView> items,
+            WbCalcView calc,
+            WbRuleView rule) {
+    }
+
+    /** 构型调整项 */
+    public record WbAdjustmentView(
+            Long id,
+            String action,
+            String itemName,
+            String weightReading,
+            String armReading,
+            String weightUnit,
+            String lengthUnit,
+            Integer quantity,
+            String reason,
+            String workCardNo,
+            Integer lineNo,
+            String unitWeightKg,
+            String armMm,
+            String totalWeightKg,
+            String moment) {
+    }
+
+    /** 构型版本 */
+    public record WbConfigVersionView(
+            Long id,
+            Long aircraftId,
+            String tailNo,
+            String model,
+            Integer versionNo,
+            String kind,
+            Long parentVersionId,
+            Long rootWeighingId,
+            Long ruleRevisionId,
+            String ruleRevisionNo,
+            String changeReason,
+            String workCardNo,
+            String operatorName,
+            String weightKg,
+            String weightLb,
+            String moment,
+            String cgArmMm,
+            String cgArmIn,
+            String envelopeStatus,
+            String envelopeStatusName,
+            String violationKindName,
+            String violationDelta,
+            String limitFrontMm,
+            String limitAftMm,
+            boolean current,
+            LocalDateTime createdAt,
+            List<WbAdjustmentView> adjustments) {
+    }
+
+    /** 飞机构型档案：基线状态 + 称重记录 + 构型链 */
+    public record WbAircraftStatusView(
+            Long aircraftId,
+            String tailNo,
+            String model,
+            String airline,
+            boolean baselineEstablished,
+            String baselineLabel,
+            Long currentConfigVersionId,
+            Integer currentVersionNo,
+            String currentWeightKg,
+            String currentCgArmMm,
+            String currentEnvelopeStatus,
+            String currentEnvelopeStatusName,
+            String ruleRevisionNo,
+            List<WbWeighingView> weighings,
+            List<WbConfigVersionView> configChain) {
+    }
+
+    /** 版本对比结果（任意两个构型版本，或基线称重 vs 构型版本） */
+    public record WbVersionDiffView(
+            WbConfigVersionView from,
+            WbConfigVersionView to,
+            String deltaWeightKg,
+            String deltaWeightLb,
+            String deltaMoment,
+            String deltaCgMm,
+            String deltaCgIn,
+            String fromStatusName,
+            String toStatusName) {
+    }
+
+    /** 审计事件 */
+    public record WbEventView(
+            Long id,
+            Long aircraftId,
+            String tailNo,
+            String eventType,
+            String operatorName,
+            String detail,
+            LocalDateTime eventAt) {
+    }
+
+    /** 模块八总览 */
+    public record WbOverview(
+            long aircraftTotal,
+            long baselineCount,
+            long noBaselineCount,
+            long outsideCount,
+            long undeterminedCount,
+            long effectiveRuleModelCount) {
+    }
 }
